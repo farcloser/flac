@@ -35,9 +35,6 @@ import (
 	"log"
 
 	"github.com/mewkiz/flac/internal/bits"
-	"github.com/mewkiz/flac/internal/hashutil"
-	"github.com/mewkiz/flac/internal/hashutil/crc16"
-	"github.com/mewkiz/flac/internal/hashutil/crc8"
 	"github.com/mewkiz/flac/internal/utf8"
 )
 
@@ -51,13 +48,11 @@ type Frame struct {
 	Header
 	// One subframe per channel, containing encoded audio samples.
 	Subframes []*Subframe
-	// CRC-16 hash sum, calculated by read operations on hr.
-	crc hashutil.Hash16
-	// A bit reader, wrapping read operations to hr.
+	// CRC reader computing CRC-16 (entire frame) and CRC-8 (header only).
+	cr *crcReader
+	// A bit reader, wrapping read operations to cr.
 	br *bits.Reader
-	// A CRC-16 hash reader, wrapping read operations to r.
-	hr io.Reader
-	// Underlying io.Reader.
+	// Underlying io.Reader (used for CRC-16 footer read, bypassing cr).
 	r io.Reader
 }
 
@@ -67,13 +62,10 @@ type Frame struct {
 //
 // Call Frame.Parse to parse the audio samples of its subframes.
 func New(r io.Reader) (frame *Frame, err error) {
-	// Create a new CRC-16 hash reader which adds the data from all read
-	// operations to a running hash.
-	crc := crc16.NewIBM()
-	hr := io.TeeReader(r, crc)
+	cr := &crcReader{r: r}
 
 	// Parse frame header.
-	frame = &Frame{crc: crc, hr: hr, r: r}
+	frame = &Frame{cr: cr, r: r}
 	err = frame.parseHeader()
 	return frame, err
 }
@@ -133,11 +125,13 @@ func (frame *Frame) Parse() error {
 	frame.Correlate()
 
 	// 2 bytes: CRC-16 checksum.
+	// Read from frame.r (raw reader) so the footer bytes are NOT included in
+	// the CRC-16 computation.
 	var want uint16
 	if err = binary.Read(frame.r, binary.BigEndian, &want); err != nil {
 		return unexpected(err)
 	}
-	got := frame.crc.Sum16()
+	got := frame.cr.CRC16()
 	if got != want {
 		return fmt.Errorf("frame.Frame.Parse: CRC-16 checksum mismatch; expected 0x%04X, got 0x%04X", want, got)
 	}
@@ -223,13 +217,11 @@ var (
 
 // parseHeader reads and parses the header of an audio frame.
 func (frame *Frame) parseHeader() error {
-	// Create a new CRC-8 hash reader which adds the data from all read
-	// operations to a running hash.
-	h := crc8.NewATM()
-	hr := io.TeeReader(frame.hr, h)
+	// Enable CRC-8 accumulation for header verification.
+	frame.cr.EnableCRC8()
 
-	// Create bit reader.
-	br := bits.NewReader(hr)
+	// Create bit reader wrapping the CRC reader.
+	br := bits.NewReader(frame.cr)
 	frame.br = br
 
 	// 14 bits: sync-code (11111111111110)
@@ -298,7 +290,10 @@ func (frame *Frame) parseHeader() error {
 	//    1-6 bytes: UTF-8 encoded frame number.
 	// else
 	//    1-7 bytes: UTF-8 encoded sample number.
-	frame.Num, err = utf8.Decode(hr)
+	// Note: at this point exactly 32 bits (4 bytes) have been consumed, so the
+	// stream is byte-aligned and br has no buffered bits. Reading directly from
+	// frame.cr is safe.
+	frame.Num, err = utf8.Decode(frame.cr)
 	if err != nil {
 		return unexpected(err)
 	}
@@ -314,11 +309,15 @@ func (frame *Frame) parseHeader() error {
 	}
 
 	// 1 byte: CRC-8 checksum.
-	var want uint8
-	if err = binary.Read(frame.hr, binary.BigEndian, &want); err != nil {
+	// Disable CRC-8 before reading the checksum byte so it is not included
+	// in the CRC-8 computation. The byte still flows through CRC-16.
+	frame.cr.DisableCRC8()
+	crc8Val, err := br.Read(8)
+	if err != nil {
 		return unexpected(err)
 	}
-	got := h.Sum8()
+	want := uint8(crc8Val)
+	got := frame.cr.CRC8()
 	if want != got {
 		return fmt.Errorf("frame.Frame.parseHeader: CRC-8 checksum mismatch; expected 0x%02X, got 0x%02X", want, got)
 	}
