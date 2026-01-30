@@ -251,16 +251,68 @@ func (subframe *Subframe) decodeConstant(br *bits.Reader, bps uint) error {
 //
 // ref: https://www.xiph.org/flac/format.html#subframe_verbatim
 func (subframe *Subframe) decodeVerbatim(br *bits.Reader, bps uint) error {
-	// Parse the unencoded audio samples of the subframe.
+	// Fast path: bulk read for byte-aligned bit depths (8, 16, 24, 32).
+	if bps%8 == 0 && br.IsAligned() {
+		return subframe.decodeVerbatimAligned(br, bps)
+	}
+
+	// Slow path: bit-by-bit for non-aligned depths (12, 20, etc).
 	for i := 0; i < subframe.NSamples; i++ {
-		// (bits-per-sample) bits: Unencoded constant value of the subblock.
 		x, err := br.Read(bps)
 		if err != nil {
 			return unexpected(err)
 		}
-		sample := signExtend(x, bps)
-		subframe.Samples = append(subframe.Samples, sample)
+		subframe.Samples = append(subframe.Samples, signExtend(x, bps))
 	}
+	return nil
+}
+
+// decodeVerbatimAligned reads verbatim samples in bulk for byte-aligned bit
+// depths. All bytes are read in a single I/O call, then unpacked into samples.
+func (subframe *Subframe) decodeVerbatimAligned(br *bits.Reader, bps uint) error {
+	bytesPerSample := int(bps / 8)
+	buf := make([]byte, subframe.NSamples*bytesPerSample)
+	if err := br.ReadAligned(buf); err != nil {
+		return unexpected(err)
+	}
+
+	subframe.Samples = subframe.Samples[:subframe.NSamples]
+
+	switch bps {
+	case 8:
+		for i, b := range buf {
+			subframe.Samples[i] = signExtend(uint64(b), 8)
+		}
+	case 16:
+		for i := range subframe.NSamples {
+			off := i * 2
+			x := uint64(buf[off])<<8 | uint64(buf[off+1])
+			subframe.Samples[i] = signExtend(x, 16)
+		}
+	case 24:
+		for i := range subframe.NSamples {
+			off := i * 3
+			x := uint64(buf[off])<<16 | uint64(buf[off+1])<<8 | uint64(buf[off+2])
+			subframe.Samples[i] = signExtend(x, 24)
+		}
+	case 32:
+		for i := range subframe.NSamples {
+			off := i * 4
+			x := uint64(buf[off])<<24 | uint64(buf[off+1])<<16 | uint64(buf[off+2])<<8 | uint64(buf[off+3])
+			subframe.Samples[i] = signExtend(x, 32)
+		}
+	default:
+		// Generic aligned path for other multiples of 8.
+		for i := range subframe.NSamples {
+			off := i * bytesPerSample
+			var x uint64
+			for j := range bytesPerSample {
+				x = x<<8 | uint64(buf[off+j])
+			}
+			subframe.Samples[i] = signExtend(x, bps)
+		}
+	}
+
 	return nil
 }
 

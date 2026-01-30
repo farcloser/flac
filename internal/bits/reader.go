@@ -24,6 +24,22 @@ func NewReader(r io.Reader) *Reader {
 	return &Reader{r: r}
 }
 
+// IsAligned reports whether the reader is at a byte boundary (no buffered bits).
+func (br *Reader) IsAligned() bool {
+	return br.n == 0
+}
+
+// ReadAligned reads exactly len(p) bytes into p. The reader must be
+// byte-aligned (no buffered bits). This enables bulk reads for byte-aligned
+// data like verbatim audio samples.
+func (br *Reader) ReadAligned(p []byte) error {
+	if br.n != 0 {
+		return fmt.Errorf("bits.Reader.ReadAligned: reader not byte-aligned (%d buffered bits)", br.n)
+	}
+	_, err := io.ReadFull(br.r, p)
+	return err
+}
+
 // Read reads and returns the next n bits, at most 64. It buffers bits up to the
 // next byte boundary.
 func (br *Reader) Read(n uint) (x uint64, err error) {
