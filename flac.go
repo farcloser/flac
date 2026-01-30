@@ -35,6 +35,7 @@ import (
 	"os"
 
 	"github.com/mewkiz/flac/frame"
+	"github.com/mewkiz/flac/internal/bits"
 	"github.com/mewkiz/flac/internal/bufseekio"
 	"github.com/mewkiz/flac/meta"
 )
@@ -62,6 +63,9 @@ type Stream struct {
 
 	// Underlying io.Reader, or io.ReadCloser.
 	r io.Reader
+	// Bit reader for frame parsing, persists across frames to preserve its
+	// internal read-ahead buffer. Created after metadata parsing completes.
+	br *bits.Reader
 }
 
 // New creates a new Stream for accessing the audio samples of r. It reads and
@@ -89,6 +93,9 @@ func New(r io.Reader) (stream *Stream, err error) {
 			return stream, err
 		}
 	}
+
+	// Create persistent bit reader for frame parsing.
+	stream.br = bits.NewReader(br)
 
 	return stream, nil
 }
@@ -124,6 +131,13 @@ func NewSeek(rs io.ReadSeeker) (stream *Stream, err error) {
 
 	// Record file offset of the first frame header.
 	stream.dataStart, err = br.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return stream, err
+	}
+
+	// Create persistent bit reader for frame parsing.
+	stream.br = bits.NewReader(br)
+
 	return stream, err
 }
 
@@ -242,6 +256,9 @@ func Parse(r io.Reader) (stream *Stream, err error) {
 		stream.Blocks = append(stream.Blocks, block)
 	}
 
+	// Create persistent bit reader for frame parsing.
+	stream.br = bits.NewReader(br)
+
 	return stream, nil
 }
 
@@ -302,13 +319,13 @@ func (stream *Stream) Close() error {
 //
 // Call Frame.Parse to parse the audio samples of its subframes.
 func (stream *Stream) Next() (f *frame.Frame, err error) {
-	return frame.New(stream.r)
+	return frame.New(stream.br)
 }
 
 // ParseNext parses the entire next frame including audio samples. It returns
 // io.EOF to signal a graceful end of FLAC stream.
 func (stream *Stream) ParseNext() (f *frame.Frame, err error) {
-	return frame.Parse(stream.r)
+	return frame.Parse(stream.br)
 }
 
 // Seek seeks to the frame containing the given absolute sample number. The
@@ -321,8 +338,6 @@ func (stream *Stream) Seek(sampleNum uint64) (uint64, error) {
 		}
 	}
 
-	rs := stream.r.(io.ReadSeeker)
-
 	isBiggerThanStream := stream.Info.NSamples != 0 && sampleNum >= stream.Info.NSamples
 	if isBiggerThanStream || sampleNum < 0 {
 		return 0, fmt.Errorf("unable to seek to sample number %d", sampleNum)
@@ -332,12 +347,12 @@ func (stream *Stream) Seek(sampleNum uint64) (uint64, error) {
 		return 0, err
 	}
 
-	if _, err := rs.Seek(stream.dataStart+int64(point.Offset), io.SeekStart); err != nil {
+	if _, err := stream.br.Seek(stream.dataStart+int64(point.Offset), io.SeekStart); err != nil {
 		return 0, err
 	}
 	for {
 		// Record seek offset to start of frame.
-		offset, err := rs.Seek(0, io.SeekCurrent)
+		offset, err := stream.br.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return 0, err
 		}
@@ -348,7 +363,7 @@ func (stream *Stream) Seek(sampleNum uint64) (uint64, error) {
 		if frame.SampleNumber()+uint64(frame.BlockSize) > sampleNum {
 			// Restore seek offset to the start of the frame containing the
 			// specified sample number.
-			_, err := rs.Seek(offset, io.SeekStart)
+			_, err := stream.br.Seek(offset, io.SeekStart)
 			return frame.SampleNumber(), err
 		}
 	}
@@ -378,27 +393,21 @@ func (stream *Stream) searchFromStart(sampleNum uint64) (meta.SeekPoint, error) 
 // makeSeekTable creates a seek table with seek points to each frame of the FLAC
 // stream.
 func (stream *Stream) makeSeekTable() (err error) {
-	rs, ok := stream.r.(io.ReadSeeker)
-	if !ok {
+	// Save current position to restore after scanning.
+	pos, err := stream.br.Seek(0, io.SeekCurrent)
+	if err != nil {
 		return ErrNoSeeker
 	}
 
-	pos, err := rs.Seek(0, io.SeekCurrent)
-	if err != nil {
+	if _, err = stream.br.Seek(stream.dataStart, io.SeekStart); err != nil {
 		return err
 	}
 
-	_, err = rs.Seek(stream.dataStart, io.SeekStart)
-	if err != nil {
-		return err
-	}
-
-	var i int
 	var sampleNum uint64
 	var points []meta.SeekPoint
 	for {
 		// Record seek offset to start of frame.
-		off, err := rs.Seek(0, io.SeekCurrent)
+		off, err := stream.br.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return err
 		}
@@ -416,11 +425,11 @@ func (stream *Stream) makeSeekTable() (err error) {
 		})
 
 		sampleNum += uint64(f.BlockSize)
-		i++
 	}
 
 	stream.seekTable = &meta.SeekTable{Points: points}
 
-	_, err = rs.Seek(pos, io.SeekStart)
+	// Restore original position.
+	_, err = stream.br.Seek(pos, io.SeekStart)
 	return err
 }

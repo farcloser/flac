@@ -32,8 +32,6 @@ import (
 	"errors"
 	"io"
 	"io/ioutil"
-
-	"github.com/mewkiz/flac/internal/bits"
 )
 
 // A Block contains the header and body of a metadata block.
@@ -130,11 +128,11 @@ type Header struct {
 }
 
 // parseHeader reads and parses the header of a metadata block.
+// The header is always exactly 4 bytes (32 bits): 1 bit IsLast, 7 bits Type,
+// 24 bits Length. Read directly to avoid buffering overhead.
 func (block *Block) parseHeader(r io.Reader) error {
-	// 1 bit: IsLast.
-	br := bits.NewReader(r)
-	x, err := br.Read(1)
-	if err != nil {
+	var buf [4]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		// This is the only place a metadata block may return io.EOF, which
 		// signals a graceful end of a FLAC stream (from a metadata point of
 		// view).
@@ -143,25 +141,18 @@ func (block *Block) parseHeader(r io.Reader) error {
 		// after the last metadata block. Therefore an io.EOF error at this
 		// location is always invalid. This logic is to be handled by the flac
 		// package however.
+		if err == io.ErrUnexpectedEOF {
+			return io.EOF
+		}
 		return err
 	}
-	if x != 0 {
-		block.IsLast = true
-	}
 
+	// 1 bit: IsLast.
+	block.IsLast = buf[0]&0x80 != 0
 	// 7 bits: Type.
-	x, err = br.Read(7)
-	if err != nil {
-		return unexpected(err)
-	}
-	block.Type = Type(x)
-
+	block.Type = Type(buf[0] & 0x7F)
 	// 24 bits: Length.
-	x, err = br.Read(24)
-	if err != nil {
-		return unexpected(err)
-	}
-	block.Length = int64(x)
+	block.Length = int64(buf[1])<<16 | int64(buf[2])<<8 | int64(buf[3])
 
 	return nil
 }

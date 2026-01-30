@@ -4,7 +4,6 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/mewkiz/flac/internal/bits"
 )
@@ -111,6 +110,8 @@ func (block *Block) parseStreamInfo() error {
 	}
 
 	// 16 bytes: MD5sum.
-	_, err = io.ReadFull(block.lr, si.MD5sum[:])
+	// Read through the bit reader since its internal buffer may have already
+	// consumed these bytes from block.lr.
+	err = br.ReadAligned(si.MD5sum[:])
 	return unexpected(err)
 }

@@ -27,7 +27,6 @@
 package frame
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash"
@@ -48,37 +47,37 @@ type Frame struct {
 	Header
 	// One subframe per channel, containing encoded audio samples.
 	Subframes []*Subframe
-	// CRC reader computing CRC-16 (entire frame) and CRC-8 (header only).
-	cr *crcReader
-	// A bit reader, wrapping read operations to cr.
+	// A bit reader with internal 4KB buffer and inline CRC computation.
 	br *bits.Reader
-	// Underlying io.Reader (used for CRC-16 footer read, bypassing cr).
-	r io.Reader
 }
 
-// New creates a new Frame for accessing the audio samples of r. It reads and
-// parses an audio frame header. It returns io.EOF to signal a graceful end of
-// FLAC stream.
+// New creates a new Frame for accessing the audio samples via the provided bit
+// reader. It reads and parses an audio frame header, resetting CRC state for
+// the new frame. It returns io.EOF to signal a graceful end of FLAC stream.
+//
+// The bit reader must persist across frames (owned by the Stream) so that its
+// internal read-ahead buffer is not lost between frames.
 //
 // Call Frame.Parse to parse the audio samples of its subframes.
-func New(r io.Reader) (frame *Frame, err error) {
-	cr := &crcReader{r: r}
+func New(br *bits.Reader) (frame *Frame, err error) {
+	// Reset CRC for the new frame.
+	br.EnableCRC16()
 
 	// Parse frame header.
-	frame = &Frame{cr: cr, r: r}
+	frame = &Frame{br: br}
 	err = frame.parseHeader()
 	return frame, err
 }
 
 // Parse reads and parses the header, and the audio samples from each subframe
-// of a frame. If the samples are inter-channel decorrelated between the
-// subframes, it correlates them. It returns io.EOF to signal a graceful end of
-// FLAC stream.
+// of a frame via the provided bit reader. If the samples are inter-channel
+// decorrelated between the subframes, it correlates them. It returns io.EOF to
+// signal a graceful end of FLAC stream.
 //
 // ref: https://www.xiph.org/flac/format.html#interchannel
-func Parse(r io.Reader) (frame *Frame, err error) {
+func Parse(br *bits.Reader) (frame *Frame, err error) {
 	// Parse frame header.
-	frame, err = New(r)
+	frame, err = New(br)
 	if err != nil {
 		return frame, err
 	}
@@ -124,14 +123,27 @@ func (frame *Frame) Parse() error {
 	// Inter-channel correlation of subframe samples.
 	frame.Correlate()
 
+	// Zero-padding to byte alignment.
+	if !frame.br.IsAligned() {
+		padding, err := frame.br.Read(frame.br.BitsBuffered())
+		if err != nil {
+			return unexpected(err)
+		}
+		if padding != 0 {
+			return fmt.Errorf("frame.Frame.Parse: non-zero padding bits (%d)", padding)
+		}
+	}
+
 	// 2 bytes: CRC-16 checksum.
-	// Read from frame.r (raw reader) so the footer bytes are NOT included in
-	// the CRC-16 computation.
-	var want uint16
-	if err = binary.Read(frame.r, binary.BigEndian, &want); err != nil {
+	// Disable CRC-16 before reading the footer so the footer bytes are NOT
+	// included in the CRC-16 computation.
+	got := frame.br.CRC16()
+	frame.br.DisableCRC16()
+	crc16Val, err := frame.br.Read(16)
+	if err != nil {
 		return unexpected(err)
 	}
-	got := frame.cr.CRC16()
+	want := uint16(crc16Val)
 	if got != want {
 		return fmt.Errorf("frame.Frame.Parse: CRC-16 checksum mismatch; expected 0x%04X, got 0x%04X", want, got)
 	}
@@ -218,11 +230,8 @@ var (
 // parseHeader reads and parses the header of an audio frame.
 func (frame *Frame) parseHeader() error {
 	// Enable CRC-8 accumulation for header verification.
-	frame.cr.EnableCRC8()
-
-	// Create bit reader wrapping the CRC reader.
-	br := bits.NewReader(frame.cr)
-	frame.br = br
+	br := frame.br
+	br.EnableCRC8()
 
 	// 14 bits: sync-code (11111111111110)
 	x, err := br.Read(14)
@@ -291,9 +300,9 @@ func (frame *Frame) parseHeader() error {
 	// else
 	//    1-7 bytes: UTF-8 encoded sample number.
 	// Note: at this point exactly 32 bits (4 bytes) have been consumed, so the
-	// stream is byte-aligned and br has no buffered bits. Reading directly from
-	// frame.cr is safe.
-	frame.Num, err = utf8.Decode(frame.cr)
+	// stream is byte-aligned. Read through the bit reader's byte adapter so
+	// bytes flow through the internal buffer and CRC computation.
+	frame.Num, err = utf8.Decode(br.ByteReader())
 	if err != nil {
 		return unexpected(err)
 	}
@@ -311,13 +320,13 @@ func (frame *Frame) parseHeader() error {
 	// 1 byte: CRC-8 checksum.
 	// Disable CRC-8 before reading the checksum byte so it is not included
 	// in the CRC-8 computation. The byte still flows through CRC-16.
-	frame.cr.DisableCRC8()
+	br.DisableCRC8()
 	crc8Val, err := br.Read(8)
 	if err != nil {
 		return unexpected(err)
 	}
 	want := uint8(crc8Val)
-	got := frame.cr.CRC8()
+	got := br.CRC8()
 	if want != got {
 		return fmt.Errorf("frame.Frame.parseHeader: CRC-8 checksum mismatch; expected 0x%02X, got 0x%02X", want, got)
 	}
