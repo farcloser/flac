@@ -49,6 +49,10 @@ type Frame struct {
 	Subframes []*Subframe
 	// A bit reader with internal 4KB buffer and inline CRC computation.
 	br *bits.Reader
+	// Contiguous sample buffer shared by all subframes. Each subframe's
+	// Samples slice points into this buffer. Allocated once per frame to
+	// avoid per-subframe allocations.
+	samplesBuf []int32
 }
 
 // New creates a new Frame for accessing the audio samples via the provided bit
@@ -94,7 +98,10 @@ func Parse(br *bits.Reader) (frame *Frame, err error) {
 // ref: https://www.xiph.org/flac/format.html#interchannel
 func (frame *Frame) Parse() error {
 	// Parse subframes.
-	frame.Subframes = make([]*Subframe, frame.Channels.Count())
+	nChannels := frame.Channels.Count()
+	blockSize := int(frame.BlockSize)
+	frame.Subframes = make([]*Subframe, nChannels)
+	frame.samplesBuf = make([]int32, nChannels*blockSize)
 	var err error
 	for channel := range frame.Subframes {
 		// The side channel requires an extra bit per sample when using
@@ -113,8 +120,12 @@ func (frame *Frame) Parse() error {
 			}
 		}
 
+		// Slice the contiguous sample buffer for this channel's subframe.
+		off := channel * blockSize
+		samples := frame.samplesBuf[off:off:off+blockSize]
+
 		// Parse subframe.
-		frame.Subframes[channel], err = frame.parseSubframe(frame.br, bps)
+		frame.Subframes[channel], err = frame.parseSubframe(frame.br, bps, samples)
 		if err != nil {
 			return err
 		}

@@ -27,7 +27,7 @@ type Subframe struct {
 
 // parseSubframe reads and parses the header, and the audio samples of a
 // subframe.
-func (frame *Frame) parseSubframe(br *bits.Reader, bps uint) (subframe *Subframe, err error) {
+func (frame *Frame) parseSubframe(br *bits.Reader, bps uint, samples []int32) (subframe *Subframe, err error) {
 	// Parse subframe header.
 	subframe = new(Subframe)
 	if err = subframe.parseHeader(br); err != nil {
@@ -38,7 +38,7 @@ func (frame *Frame) parseSubframe(br *bits.Reader, bps uint) (subframe *Subframe
 
 	// Decode subframe audio samples.
 	subframe.NSamples = int(frame.BlockSize)
-	subframe.Samples = make([]int32, 0, subframe.NSamples)
+	subframe.Samples = samples[:0]
 	switch subframe.Pred {
 	case PredConstant:
 		err = subframe.decodeConstant(br, bps)
