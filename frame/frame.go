@@ -153,7 +153,7 @@ func (frame *Frame) Parse() error {
 func (frame *Frame) Hash(md5sum hash.Hash) {
 	// Write decoded samples to a running MD5 hash.
 	bps := frame.BitsPerSample
-	var buf [3]byte
+	var buf [4]byte
 	if len(frame.Subframes) == 0 {
 		return
 	}
@@ -174,7 +174,13 @@ func (frame *Frame) Hash(md5sum hash.Hash) {
 				buf[0] = uint8(sample)
 				buf[1] = uint8(sample >> 8)
 				buf[2] = uint8(sample >> 16)
-				md5sum.Write(buf[:])
+				md5sum.Write(buf[:3])
+			case 25 <= bps && bps <= 32:
+				buf[0] = uint8(sample)
+				buf[1] = uint8(sample >> 8)
+				buf[2] = uint8(sample >> 16)
+				buf[3] = uint8(sample >> 24)
+				md5sum.Write(buf[:4])
 			default:
 				log.Printf("frame.Frame.Hash: support for %d-bit sample size not yet implemented", bps)
 			}
@@ -355,9 +361,11 @@ func (frame *Frame) parseBitsPerSample(br *bits.Reader) error {
 	case 0x6:
 		// 110: 24 bits-per-sample.
 		frame.BitsPerSample = 24
+	case 0x7:
+		// 111: 32 bits-per-sample (RFC 9639).
+		frame.BitsPerSample = 32
 	default:
 		// 011: reserved.
-		// 111: reserved.
 		return fmt.Errorf("frame.Frame.parseHeader: reserved sample size bit pattern (%03b)", x)
 	}
 	return nil

@@ -406,7 +406,7 @@ func encodeFrameHeaderBitsPerSample(bw *bitio.Writer, bps uint8) error {
 	//    100 : 16 bits per sample
 	//    101 : 20 bits per sample
 	//    110 : 24 bits per sample
-	//    111 : reserved
+	//    111 : 32 bits per sample (RFC 9639)
 	var bits uint64
 	switch bps {
 	case 0:
@@ -427,6 +427,9 @@ func encodeFrameHeaderBitsPerSample(bw *bitio.Writer, bps uint8) error {
 	case 24:
 		// 110 : 24 bits per sample
 		bits = 0x6
+	case 32:
+		// 111 : 32 bits per sample (RFC 9639)
+		bits = 0x7
 	default:
 		return errutil.Newf("support for sample size %v not yet implemented", bps)
 	}
