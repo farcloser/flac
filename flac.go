@@ -319,13 +319,43 @@ func (stream *Stream) Close() error {
 //
 // Call Frame.Parse to parse the audio samples of its subframes.
 func (stream *Stream) Next() (f *frame.Frame, err error) {
-	return frame.New(stream.br)
+	f, err = frame.New(stream.br)
+	if err != nil {
+		return f, err
+	}
+
+	// Each frame header independently specifies its own channel assignment
+	// (frame/frame.go parseChannels), which may differ from StreamInfo.NChannels
+	// in malformed files (e.g. IETF faulty/04 "wrong number of channels") or in
+	// uncommon files where the channel count changes mid-stream (e.g. IETF
+	// uncommon/03 "decreasing number of channels").
+	//
+	// Callers (decoders) typically allocate buffers and interleave samples based
+	// on StreamInfo.NChannels. A mismatch causes index-out-of-range panics in
+	// interleave loops when the frame has fewer subframes than expected.
+	//
+	// Return a clear error instead of letting the caller panic.
+	if got, want := f.Channels.Count(), int(stream.Info.NChannels); got != want {
+		return nil, fmt.Errorf("flac.Stream.Next: channel count mismatch; frame has %d channels, StreamInfo has %d", got, want)
+	}
+
+	return f, nil
 }
 
 // ParseNext parses the entire next frame including audio samples. It returns
 // io.EOF to signal a graceful end of FLAC stream.
 func (stream *Stream) ParseNext() (f *frame.Frame, err error) {
-	return frame.Parse(stream.br)
+	f, err = frame.Parse(stream.br)
+	if err != nil {
+		return f, err
+	}
+
+	// See Next() for rationale on channel count validation.
+	if got, want := f.Channels.Count(), int(stream.Info.NChannels); got != want {
+		return nil, fmt.Errorf("flac.Stream.ParseNext: channel count mismatch; frame has %d channels, StreamInfo has %d", got, want)
+	}
+
+	return f, nil
 }
 
 // Seek seeks to the frame containing the given absolute sample number. The
