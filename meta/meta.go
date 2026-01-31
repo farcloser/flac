@@ -58,6 +58,21 @@ func New(r io.Reader) (block *Block, err error) {
 		return block, err
 	}
 	block.lr = io.LimitReader(r, block.Length)
+
+	// Validate block type after the LimitReader is set up, so callers can
+	// still call block.Skip() on reserved types (7-126) as the FLAC spec
+	// requires. Type 127 is invalid per spec.
+	//
+	// This catches garbage headers produced when a preceding block has an
+	// incorrect length (e.g. IETF faulty/11), where the parser reads audio
+	// frame data as a metadata header and gets type 0x7F from 0xFF bytes.
+	if block.Type == 127 {
+		return block, ErrInvalidType
+	}
+	if block.Type >= 7 {
+		return block, ErrReservedType
+	}
+
 	return block, nil
 }
 
