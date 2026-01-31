@@ -61,6 +61,11 @@ type Stream struct {
 	// is relative to this position.
 	dataStart int64
 
+	// samplesDecoded tracks the running total of inter-channel samples decoded
+	// so far. Used to detect when frame data exceeds the total sample count
+	// declared in StreamInfo.NSamples (which callers use for buffer allocation).
+	samplesDecoded uint64
+
 	// Underlying io.Reader, or io.ReadCloser.
 	r io.Reader
 	// Bit reader for frame parsing, persists across frames to preserve its
@@ -339,6 +344,13 @@ func (stream *Stream) Next() (f *frame.Frame, err error) {
 		return nil, fmt.Errorf("flac.Stream.Next: channel count mismatch; frame has %d channels, StreamInfo has %d", got, want)
 	}
 
+	// Validate running sample count against StreamInfo.NSamples.
+	// See ParseNext() for detailed rationale.
+	stream.samplesDecoded += uint64(f.BlockSize)
+	if err = stream.validateSampleCount(); err != nil {
+		return nil, err
+	}
+
 	return f, nil
 }
 
@@ -355,7 +367,44 @@ func (stream *Stream) ParseNext() (f *frame.Frame, err error) {
 		return nil, fmt.Errorf("flac.Stream.ParseNext: channel count mismatch; frame has %d channels, StreamInfo has %d", got, want)
 	}
 
+	// Track running sample count and validate against StreamInfo.NSamples.
+	//
+	// StreamInfo.NSamples declares the total number of inter-channel samples in
+	// the stream. A value of 0 means "unknown" (valid per spec). When non-zero,
+	// callers rely on it for buffer pre-allocation:
+	//
+	//   buf = make([]byte, NSamples * NChannels * bytesPerSample)
+	//
+	// If the actual frame data exceeds the declared count (e.g. IETF faulty/05
+	// "wrong total number of samples"), the pre-allocated buffer is too small and
+	// interleave writes panic with a slice-bounds-out-of-range error.
+	//
+	// Catch the mismatch here so callers get an error instead of a panic.
+	stream.samplesDecoded += uint64(f.BlockSize)
+	if err = stream.validateSampleCount(); err != nil {
+		return nil, err
+	}
+
 	return f, nil
+}
+
+// validateSampleCount returns an error if the running total of decoded samples
+// exceeds the total declared in StreamInfo.NSamples (when non-zero).
+func (stream *Stream) validateSampleCount() error {
+	nsamples := stream.Info.NSamples
+	if nsamples == 0 {
+		// NSamples of 0 means "unknown" per spec; nothing to validate.
+		return nil
+	}
+
+	if stream.samplesDecoded > nsamples {
+		return fmt.Errorf(
+			"flac.Stream: decoded samples (%d) exceed StreamInfo.NSamples (%d)",
+			stream.samplesDecoded, nsamples,
+		)
+	}
+
+	return nil
 }
 
 // Seek seeks to the frame containing the given absolute sample number. The
@@ -372,6 +421,7 @@ func (stream *Stream) Seek(sampleNum uint64) (uint64, error) {
 	if isBiggerThanStream || sampleNum < 0 {
 		return 0, fmt.Errorf("unable to seek to sample number %d", sampleNum)
 	}
+
 	point, err := stream.searchFromStart(sampleNum)
 	if err != nil {
 		return 0, err
@@ -380,21 +430,38 @@ func (stream *Stream) Seek(sampleNum uint64) (uint64, error) {
 	if _, err := stream.br.Seek(stream.dataStart+int64(point.Offset), io.SeekStart); err != nil {
 		return 0, err
 	}
+
+	// Reset the decoded sample counter to the seek point's starting sample.
+	// The loop below calls ParseNext to scan forward from the seek point to
+	// the frame containing sampleNum. These are internal scanning calls — not
+	// caller-visible decoding — but ParseNext still accumulates the counter.
+	// Starting from the seek point's sample number keeps the running total
+	// consistent with the actual stream position, so validateSampleCount
+	// works correctly during the scan.
+	stream.samplesDecoded = point.SampleNum
+
 	for {
 		// Record seek offset to start of frame.
 		offset, err := stream.br.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return 0, err
 		}
-		frame, err := stream.ParseNext()
+		f, err := stream.ParseNext()
 		if err != nil {
 			return 0, err
 		}
-		if frame.SampleNumber()+uint64(frame.BlockSize) > sampleNum {
+		if f.SampleNumber()+uint64(f.BlockSize) > sampleNum {
 			// Restore seek offset to the start of the frame containing the
 			// specified sample number.
+			//
+			// Reset decoded sample counter to this frame's starting sample.
+			// The reader is rewound to the frame's start, so the caller's
+			// next ParseNext will re-decode this frame and re-add its
+			// BlockSize to the counter.
+			stream.samplesDecoded = f.SampleNumber()
+
 			_, err := stream.br.Seek(offset, io.SeekStart)
-			return frame.SampleNumber(), err
+			return f.SampleNumber(), err
 		}
 	}
 }
@@ -433,6 +500,15 @@ func (stream *Stream) makeSeekTable() (err error) {
 		return err
 	}
 
+	// Save and restore samplesDecoded around the scan. makeSeekTable is an
+	// internal operation that parses every frame to build seek points — it
+	// does not represent actual decoding progress for the caller. Without
+	// this save/restore, the running counter would accumulate the entire
+	// file's worth of samples, causing validateSampleCount to reject
+	// subsequent legitimate ParseNext calls.
+	savedSamples := stream.samplesDecoded
+	stream.samplesDecoded = 0
+
 	var sampleNum uint64
 	var points []meta.SeekPoint
 	for {
@@ -458,6 +534,7 @@ func (stream *Stream) makeSeekTable() (err error) {
 	}
 
 	stream.seekTable = &meta.SeekTable{Points: points}
+	stream.samplesDecoded = savedSamples
 
 	// Restore original position.
 	_, err = stream.br.Seek(pos, io.SeekStart)
