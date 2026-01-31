@@ -344,6 +344,17 @@ func (stream *Stream) Next() (f *frame.Frame, err error) {
 		return nil, fmt.Errorf("flac.Stream.Next: channel count mismatch; frame has %d channels, StreamInfo has %d", got, want)
 	}
 
+	// Each frame header independently specifies its own bit depth
+	// (frame/frame.go parseBitsPerSample). A value of 0 means "get from
+	// StreamInfo" (valid per spec). When explicitly set, it must match
+	// StreamInfo.BitsPerSample — a mismatch (e.g. IETF faulty/03 "wrong
+	// bits per sample in frame header") means the frame was encoded at a
+	// different resolution than the stream declares, which corrupts sample
+	// decoding and buffer sizing.
+	if f.BitsPerSample != 0 && f.BitsPerSample != stream.Info.BitsPerSample {
+		return nil, fmt.Errorf("flac.Stream.Next: bit depth mismatch; frame has %d bits, StreamInfo has %d", f.BitsPerSample, stream.Info.BitsPerSample)
+	}
+
 	// Validate running sample count against StreamInfo.NSamples.
 	// See ParseNext() for detailed rationale.
 	stream.samplesDecoded += uint64(f.BlockSize)
@@ -365,6 +376,11 @@ func (stream *Stream) ParseNext() (f *frame.Frame, err error) {
 	// See Next() for rationale on channel count validation.
 	if got, want := f.Channels.Count(), int(stream.Info.NChannels); got != want {
 		return nil, fmt.Errorf("flac.Stream.ParseNext: channel count mismatch; frame has %d channels, StreamInfo has %d", got, want)
+	}
+
+	// See Next() for rationale on bit depth validation.
+	if f.BitsPerSample != 0 && f.BitsPerSample != stream.Info.BitsPerSample {
+		return nil, fmt.Errorf("flac.Stream.ParseNext: bit depth mismatch; frame has %d bits, StreamInfo has %d", f.BitsPerSample, stream.Info.BitsPerSample)
 	}
 
 	// Track running sample count and validate against StreamInfo.NSamples.
