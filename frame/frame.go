@@ -635,17 +635,20 @@ func (frame *Frame) Correlate() {
 		for i := range side {
 			// left = (2*mid + side)/2
 			// right = (2*mid - side)/2
-			m := mid[i]
-			s := side[i]
-			m *= 2
+			//
+			// Use int64 to avoid overflow: for 32bps audio, mid values can
+			// reach 2^31-1 and m*2 overflows int32, producing wrong output.
+			m := int64(mid[i])
+			s := int64(side[i])
+			m <<= 1
 			// Notice that the integer division in mid = (left + right)/2 discards
 			// the least significant bit. It can be reconstructed however, since a
 			// sum A+B and a difference A-B has the same least significant bit.
 			//
 			// ref: Data Compression: The Complete Reference (ch. 7, Decorrelation)
 			m |= s & 1
-			mid[i] = (m + s) / 2
-			side[i] = (m - s) / 2
+			mid[i] = int32((m + s) >> 1)
+			side[i] = int32((m - s) >> 1)
 		}
 	}
 }
