@@ -56,7 +56,7 @@ func (frame *Frame) parseSubframeInto(br *bits.Reader, bps uint, samples []int32
 
 	// Decode subframe audio samples.
 	subframe.NSamples = int(frame.BlockSize)
-	subframe.Samples = samples[:0]
+	subframe.Samples = samples[:subframe.NSamples]
 	var err error
 	switch subframe.Pred {
 	case PredConstant:
@@ -259,8 +259,8 @@ func (subframe *Subframe) decodeConstant(br *bits.Reader, bps uint) error {
 
 	// Each sample of the subframe has the same constant value.
 	sample := signExtend(x, bps)
-	for i := 0; i < subframe.NSamples; i++ {
-		subframe.Samples = append(subframe.Samples, sample)
+	for i := range subframe.Samples {
+		subframe.Samples[i] = sample
 	}
 
 	return nil
@@ -276,12 +276,12 @@ func (subframe *Subframe) decodeVerbatim(br *bits.Reader, bps uint) error {
 	}
 
 	// Slow path: bit-by-bit for non-aligned depths (12, 20, etc).
-	for i := 0; i < subframe.NSamples; i++ {
+	for i := range subframe.Samples {
 		x, err := br.Read(bps)
 		if err != nil {
 			return unexpected(err)
 		}
-		subframe.Samples = append(subframe.Samples, signExtend(x, bps))
+		subframe.Samples[i] = signExtend(x, bps)
 	}
 	return nil
 }
@@ -363,14 +363,13 @@ var FixedCoeffs = [...][]int32{
 // ref: https://www.xiph.org/flac/format.html#subframe_fixed
 func (subframe *Subframe) decodeFixed(br *bits.Reader, bps uint) error {
 	// Parse unencoded warm-up samples.
-	for i := 0; i < subframe.Order; i++ {
+	for i := range subframe.Order {
 		// (bits-per-sample) bits: Unencoded warm-up sample.
 		x, err := br.Read(bps)
 		if err != nil {
 			return unexpected(err)
 		}
-		sample := signExtend(x, bps)
-		subframe.Samples = append(subframe.Samples, sample)
+		subframe.Samples[i] = signExtend(x, bps)
 	}
 
 	// Decode subframe residuals.
@@ -391,14 +390,13 @@ func (subframe *Subframe) decodeFixed(br *bits.Reader, bps uint) error {
 // ref: https://www.xiph.org/flac/format.html#subframe_lpc
 func (subframe *Subframe) decodeFIR(br *bits.Reader, bps uint) error {
 	// Parse unencoded warm-up samples.
-	for i := 0; i < subframe.Order; i++ {
+	for i := range subframe.Order {
 		// (bits-per-sample) bits: Unencoded warm-up sample.
 		x, err := br.Read(bps)
 		if err != nil {
 			return unexpected(err)
 		}
-		sample := signExtend(x, bps)
-		subframe.Samples = append(subframe.Samples, sample)
+		subframe.Samples[i] = signExtend(x, bps)
 	}
 
 	// 4 bits: (coefficients' precision in bits) - 1.
@@ -511,7 +509,9 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 	// Zero the partition structs for reuse.
 	clear(partitions)
 	riceSubframe.Partitions = partitions
-	for i := 0; i < nparts; i++ {
+	// Write cursor into subframe.Samples, starting after warm-up samples.
+	sIdx := subframe.Order
+	for i := range nparts {
 		partition := &partitions[i]
 		// (4 or 5) bits: Rice parameter.
 		x, err = br.Read(paramSize)
@@ -540,7 +540,7 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 			}
 			n := uint(x)
 			partition.EscapedBitsPerSample = n
-			for j := 0; j < nsamples; j++ {
+			for range nsamples {
 				sample, err := br.Read(n)
 				if err != nil {
 					return unexpected(err)
@@ -553,18 +553,20 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 				// complement.  For example, when a partition is escaped and each
 				// residual sample is stored with 3 bits, the number -1 is
 				// represented as 0b111.
-				subframe.Samples = append(subframe.Samples, int32(bits.IntN(sample, n)))
+				subframe.Samples[sIdx] = int32(bits.IntN(sample, n))
+				sIdx++
 			}
 			continue
 		}
 
 		// Decode the Rice encoded residuals of the partition.
-		for j := 0; j < nsamples; j++ {
+		for range nsamples {
 			residual, err := subframe.decodeRiceResidual(br, param)
 			if err != nil {
 				return err
 			}
-			subframe.Samples = append(subframe.Samples, residual)
+			subframe.Samples[sIdx] = residual
+			sIdx++
 		}
 	}
 
