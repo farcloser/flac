@@ -568,9 +568,9 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 
 		// Decode the Rice encoded residuals of the partition.
 		for range nsamples {
-			residual, err := subframe.decodeRiceResidual(br, param)
+			residual, err := br.ReadRice(param)
 			if err != nil {
-				return err
+				return unexpected(err)
 			}
 			subframe.Samples[sIdx] = residual
 			sIdx++
@@ -578,27 +578,6 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 	}
 
 	return nil
-}
-
-// decodeRiceResidual decodes and returns a Rice encoded residual (error
-// signal).
-func (subframe *Subframe) decodeRiceResidual(br *bits.Reader, k uint) (int32, error) {
-	// Read unary encoded most significant bits.
-	high, err := br.ReadUnary()
-	if err != nil {
-		return 0, unexpected(err)
-	}
-
-	// Read binary encoded least significant bits.
-	low, err := br.Read(k)
-	if err != nil {
-		return 0, unexpected(err)
-	}
-	folded := uint32(high<<k | low)
-
-	// ZigZag decode.
-	residual := bits.DecodeZigZag(folded)
-	return residual, nil
 }
 
 // decodeLPC decodes linear prediction coded audio samples, using the
