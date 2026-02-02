@@ -1,3 +1,4 @@
 *.flac
 *.wav
 _resources_
+.DS_Store

@@ -1,3 +1,15 @@
+NOTE:
+
+This is a working fork of the excellent github.com/mewkiz/flac library.
+
+The primary focus of the fork is on decoding performance.
+
+Compared to the reference C decoder implementation:
+- upstream: 3.8x slower
+- this fork: 1.9x slower
+
+All improvements in this fork should be upstreamed if deemed desirable by the maintainers.
+
 # flac
 
 [![Go build status](https://github.com/mewkiz/flac/actions/workflows/go.yml/badge.svg?branch=master)](https://github.com/mewkiz/flac/actions/workflows/go.yml)
