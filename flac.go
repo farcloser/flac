@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 
 	"github.com/mewkiz/flac/frame"
 	"github.com/mewkiz/flac/internal/bits"
@@ -446,8 +447,7 @@ func (stream *Stream) Seek(sampleNum uint64) (uint64, error) {
 		}
 	}
 
-	isBiggerThanStream := stream.Info.NSamples != 0 && sampleNum >= stream.Info.NSamples
-	if isBiggerThanStream || sampleNum < 0 {
+	if stream.Info.NSamples != 0 && sampleNum >= stream.Info.NSamples {
 		return 0, fmt.Errorf("unable to seek to sample number %d", sampleNum)
 	}
 
@@ -495,25 +495,23 @@ func (stream *Stream) Seek(sampleNum uint64) (uint64, error) {
 	}
 }
 
-// TODO(_): Utilize binary search in searchFromStart.
-
-// searchFromStart searches for the given sample number from the start of the
-// seek table and returns the last seek point containing the sample number. If
-// no seek point contains the sample number, the last seek point preceding the
-// sample number is returned. If the sample number is lower than the first seek
-// point, the first seek point is returned.
+// searchFromStart searches for the given sample number using binary search and
+// returns the last seek point whose start sample is at or before sampleNum. If
+// sampleNum is before the first seek point, the first seek point is returned.
 func (stream *Stream) searchFromStart(sampleNum uint64) (meta.SeekPoint, error) {
-	if len(stream.seekTable.Points) == 0 {
+	points := stream.seekTable.Points
+	if len(points) == 0 {
 		return meta.SeekPoint{}, ErrNoSeektable
 	}
-	prev := stream.seekTable.Points[0]
-	for _, p := range stream.seekTable.Points {
-		if p.SampleNum+uint64(p.NSamples) >= sampleNum {
-			return prev, nil
-		}
-		prev = p
+	// Find the first point where SampleNum > sampleNum.
+	// The point before it is the last one starting at or before sampleNum.
+	i := sort.Search(len(points), func(i int) bool {
+		return points[i].SampleNum > sampleNum
+	}) - 1
+	if i < 0 {
+		i = 0
 	}
-	return prev, nil
+	return points[i], nil
 }
 
 // makeSeekTable creates a seek table with seek points to each frame of the FLAC

@@ -111,8 +111,8 @@ func chooseRice(residuals []int32) uint {
 }
 
 // costFixed returns the number of bits needed to code the subframe with the
-// given parameters. 6 bits for the subframe header are included so orders with
-// more warm-up samples are fairly compared.
+// given parameters. Includes the subframe header, warm-up samples, residual
+// coding overhead, and all Rice-coded residuals.
 func costFixed(order int, bps uint, residuals []int32, k uint) int {
 	warmUpBits := order * int(bps)
 
@@ -124,8 +124,11 @@ func costFixed(order int, bps uint, residuals []int32, k uint) int {
 		residBits += int(quo) + 1 + int(k)
 	}
 
-	// Subframe header is 6 bits + 1 wasted flag bit (always 0 here)
-	return 6 + warmUpBits + residBits
+	// 6 bits: subframe header (1 zero-pad + 6 pred type/order + 1 wasted flag)
+	// 2 bits: residual coding method
+	// 4 bits: partition order
+	const headerBits = 6 + 2 + 4
+	return headerBits + warmUpBits + residBits
 }
 
 // analyzeSubframe decides on the best prediction method (constant, verbatim, or

@@ -491,6 +491,14 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 		return unexpected(err)
 	}
 	partOrder := int(x)
+
+	// FLAC spec: block_size / (2^partition_order) must be >= predictor_order.
+	// A malformed file violating this produces negative sample counts per partition.
+	nparts := 1 << partOrder
+	if subframe.NSamples/nparts < subframe.Order {
+		return fmt.Errorf("frame.Subframe.decodeRicePart: partition order %d too large for block size %d with predictor order %d", partOrder, subframe.NSamples, subframe.Order)
+	}
+
 	riceSubframe := &RiceSubframe{
 		PartOrder: partOrder,
 	}
@@ -500,7 +508,6 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 	//
 	// ref: https://www.xiph.org/flac/format.html#rice_partition
 	// ref: https://www.xiph.org/flac/format.html#rice2_partition
-	nparts := 1 << partOrder
 	// Reuse the grow-only partition buffer across frames.
 	if cap(subframe.partitionsBuf) < nparts {
 		subframe.partitionsBuf = make([]RicePartition, nparts)
