@@ -91,19 +91,54 @@ func Parse(br *bits.Reader) (frame *Frame, err error) {
 	return frame, err
 }
 
+// ParseInto is like Parse but reuses pre-allocated buffers to avoid per-frame
+// heap allocations. samplesBuf must have capacity for at least
+// nChannels*blockSize int32 values. subframes must have length >= nChannels,
+// with each element pointing to a valid Subframe struct that will be reset and
+// reused.
+func ParseInto(br *bits.Reader, samplesBuf []int32, subframes []*Subframe) (*Frame, error) {
+	frame, err := New(br)
+	if err != nil {
+		return frame, err
+	}
+	err = frame.parseInto(samplesBuf, subframes)
+	return frame, err
+}
+
 // Parse reads and parses the audio samples from each subframe of the frame. If
 // the samples are inter-channel decorrelated between the subframes, it
 // correlates them.
 //
 // ref: https://www.xiph.org/flac/format.html#interchannel
 func (frame *Frame) Parse() error {
-	// Parse subframes.
+	// Allocate fresh buffers.
 	nChannels := frame.Channels.Count()
 	blockSize := int(frame.BlockSize)
-	frame.Subframes = make([]*Subframe, nChannels)
 	frame.samplesBuf = make([]int32, nChannels*blockSize)
-	var err error
-	for channel := range frame.Subframes {
+	frame.Subframes = make([]*Subframe, nChannels)
+	for i := range frame.Subframes {
+		frame.Subframes[i] = new(Subframe)
+	}
+	return frame.parseSubframes()
+}
+
+// parseInto sets up the frame to use pre-allocated buffers and parses all
+// subframes.
+func (frame *Frame) parseInto(samplesBuf []int32, subframes []*Subframe) error {
+	nChannels := frame.Channels.Count()
+	blockSize := int(frame.BlockSize)
+	frame.samplesBuf = samplesBuf[:nChannels*blockSize]
+	frame.Subframes = subframes[:nChannels]
+	return frame.parseSubframes()
+}
+
+// parseSubframes parses all subframe audio samples, correlates inter-channel
+// samples, verifies padding alignment and the CRC-16 footer. The frame's
+// Subframes slice and samplesBuf must already be set up before calling.
+func (frame *Frame) parseSubframes() error {
+	nChannels := frame.Channels.Count()
+	blockSize := int(frame.BlockSize)
+	for channel := range nChannels {
 		// The side channel requires an extra bit per sample when using
 		// inter-channel decorrelation.
 		bps := uint(frame.BitsPerSample)
@@ -124,9 +159,8 @@ func (frame *Frame) Parse() error {
 		off := channel * blockSize
 		samples := frame.samplesBuf[off:off:off+blockSize]
 
-		// Parse subframe.
-		frame.Subframes[channel], err = frame.parseSubframe(frame.br, bps, samples)
-		if err != nil {
+		// Parse subframe into the pre-allocated struct.
+		if err := frame.parseSubframeInto(frame.br, bps, samples, frame.Subframes[channel]); err != nil {
 			return err
 		}
 	}

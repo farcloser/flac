@@ -1,9 +1,3 @@
-// TODO(u): Evaluate storing the samples (and residuals) during frame audio
-// decoding in a buffer allocated for the stream. This buffer would be allocated
-// using BlockSize and NChannels from the StreamInfo block, and it could be
-// reused in between calls to Next and ParseNext. This should reduce GC
-// pressure.
-
 // TODO: Remove note about encoder API.
 
 // Package flac provides access to FLAC (Free Lossless Audio Codec) streams.
@@ -27,7 +21,6 @@
 package flac
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -71,6 +64,11 @@ type Stream struct {
 	// Bit reader for frame parsing, persists across frames to preserve its
 	// internal read-ahead buffer. Created after metadata parsing completes.
 	br *bits.Reader
+
+	// Reusable decode buffers, sized to StreamInfo.BlockSize * NChannels.
+	// Allocated once after parsing StreamInfo, reused across ParseNext calls.
+	samplesBuf  []int32
+	subframeBuf []*frame.Subframe
 }
 
 // New creates a new Stream for accessing the audio samples of r. It reads and
@@ -81,8 +79,7 @@ type Stream struct {
 // Stream.ParseNext to parse the entire next frame including audio samples.
 func New(r io.Reader) (stream *Stream, err error) {
 	// Verify FLAC signature and parse the StreamInfo metadata block.
-	br := bufio.NewReader(r)
-	stream = &Stream{r: br}
+	stream = &Stream{r: r}
 	block, err := stream.parseStreamInfo()
 	if err != nil {
 		return nil, err
@@ -90,7 +87,7 @@ func New(r io.Reader) (stream *Stream, err error) {
 
 	// Skip the remaining metadata blocks.
 	for !block.IsLast {
-		block, err = meta.New(br)
+		block, err = meta.New(r)
 		if err != nil && err != meta.ErrReservedType {
 			return stream, err
 		}
@@ -100,7 +97,8 @@ func New(r io.Reader) (stream *Stream, err error) {
 	}
 
 	// Create persistent bit reader for frame parsing.
-	stream.br = bits.NewReader(br)
+	stream.br = bits.NewReader(r)
+	stream.initDecodeBuffers()
 
 	return stream, nil
 }
@@ -142,6 +140,7 @@ func NewSeek(rs io.ReadSeeker) (stream *Stream, err error) {
 
 	// Create persistent bit reader for frame parsing.
 	stream.br = bits.NewReader(br)
+	stream.initDecodeBuffers()
 
 	return stream, err
 }
@@ -210,22 +209,23 @@ func (stream *Stream) parseStreamInfo() (block *meta.Block, err error) {
 
 // skipID3v2 skips ID3v2 data prepended to flac files.
 func (stream *Stream) skipID3v2() error {
-	r := bufio.NewReader(stream.r)
+	r := stream.r
 
-	// Discard unnecessary data from the ID3v2 header.
-	if _, err := r.Discard(2); err != nil {
+	// Discard 2 unnecessary bytes from the ID3v2 header (version + flags).
+	var skip [2]byte
+	if _, err := io.ReadFull(r, skip[:]); err != nil {
 		return err
 	}
 
 	// Read the size from the ID3v2 header.
 	var sizeBuf [4]byte
-	if _, err := r.Read(sizeBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, sizeBuf[:]); err != nil {
 		return err
 	}
 	// The size is encoded as a synchsafe integer.
-	size := int(sizeBuf[0])<<21 | int(sizeBuf[1])<<14 | int(sizeBuf[2])<<7 | int(sizeBuf[3])
+	size := int64(sizeBuf[0])<<21 | int64(sizeBuf[1])<<14 | int64(sizeBuf[2])<<7 | int64(sizeBuf[3])
 
-	_, err := r.Discard(size)
+	_, err := io.CopyN(io.Discard, r, size)
 	return err
 }
 
@@ -236,8 +236,7 @@ func (stream *Stream) skipID3v2() error {
 // Stream.ParseNext to parse the entire next frame including audio samples.
 func Parse(r io.Reader) (stream *Stream, err error) {
 	// Verify FLAC signature and parse the StreamInfo metadata block.
-	br := bufio.NewReader(r)
-	stream = &Stream{r: br}
+	stream = &Stream{r: r}
 	block, err := stream.parseStreamInfo()
 	if err != nil {
 		return nil, err
@@ -245,7 +244,7 @@ func Parse(r io.Reader) (stream *Stream, err error) {
 
 	// Parse the remaining metadata blocks.
 	for !block.IsLast {
-		block, err = meta.Parse(br)
+		block, err = meta.Parse(r)
 		if err != nil {
 			if err != meta.ErrReservedType {
 				return stream, err
@@ -262,7 +261,8 @@ func Parse(r io.Reader) (stream *Stream, err error) {
 	}
 
 	// Create persistent bit reader for frame parsing.
-	stream.br = bits.NewReader(br)
+	stream.br = bits.NewReader(r)
+	stream.initDecodeBuffers()
 
 	return stream, nil
 }
@@ -319,6 +319,19 @@ func (stream *Stream) Close() error {
 	return nil
 }
 
+// initDecodeBuffers pre-allocates sample and subframe buffers sized to the
+// stream's maximum block size and channel count. These buffers are reused
+// across ParseNext calls to avoid per-frame heap allocations.
+func (stream *Stream) initDecodeBuffers() {
+	nChannels := int(stream.Info.NChannels)
+	blockSize := int(stream.Info.BlockSizeMax)
+	stream.samplesBuf = make([]int32, nChannels*blockSize)
+	stream.subframeBuf = make([]*frame.Subframe, nChannels)
+	for i := range stream.subframeBuf {
+		stream.subframeBuf[i] = new(frame.Subframe)
+	}
+}
+
 // Next parses the frame header of the next audio frame. It returns io.EOF to
 // signal a graceful end of FLAC stream.
 //
@@ -368,7 +381,7 @@ func (stream *Stream) Next() (f *frame.Frame, err error) {
 // ParseNext parses the entire next frame including audio samples. It returns
 // io.EOF to signal a graceful end of FLAC stream.
 func (stream *Stream) ParseNext() (f *frame.Frame, err error) {
-	f, err = frame.Parse(stream.br)
+	f, err = frame.ParseInto(stream.br, stream.samplesBuf, stream.subframeBuf)
 	if err != nil {
 		return f, err
 	}

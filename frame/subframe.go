@@ -23,15 +23,33 @@ type Subframe struct {
 	Samples []int32
 	// Number of audio samples in the subframe.
 	NSamples int
+
+	// Reusable buffers preserved across frames to avoid per-frame allocations.
+
+	// coeffsBuf holds LPC predictor coefficients. Max LPC order is 32 per spec.
+	coeffsBuf [32]int32
+	// partitionsBuf holds Rice partitions (grow-only across frames).
+	partitionsBuf []RicePartition
+	// verbatimBuf holds raw bytes for aligned verbatim decoding (grow-only).
+	verbatimBuf []byte
 }
 
-// parseSubframe reads and parses the header, and the audio samples of a
-// subframe.
-func (frame *Frame) parseSubframe(br *bits.Reader, bps uint, samples []int32) (subframe *Subframe, err error) {
+// parseSubframeInto reads and parses the header, and the audio samples of a
+// subframe into the provided Subframe struct, which is reset before use. This
+// allows callers to reuse Subframe allocations across frames.
+func (frame *Frame) parseSubframeInto(br *bits.Reader, bps uint, samples []int32, subframe *Subframe) error {
+	// Save reusable buffers before reset.
+	partitionsBuf := subframe.partitionsBuf
+	verbatimBuf := subframe.verbatimBuf
+
+	// Reset subframe for reuse, then restore reusable buffers.
+	*subframe = Subframe{}
+	subframe.partitionsBuf = partitionsBuf
+	subframe.verbatimBuf = verbatimBuf
+
 	// Parse subframe header.
-	subframe = new(Subframe)
-	if err = subframe.parseHeader(br); err != nil {
-		return subframe, err
+	if err := subframe.parseHeader(br); err != nil {
+		return err
 	}
 	// Adjust bps of subframe for wasted bits-per-sample.
 	bps -= subframe.Wasted
@@ -39,6 +57,7 @@ func (frame *Frame) parseSubframe(br *bits.Reader, bps uint, samples []int32) (s
 	// Decode subframe audio samples.
 	subframe.NSamples = int(frame.BlockSize)
 	subframe.Samples = samples[:0]
+	var err error
 	switch subframe.Pred {
 	case PredConstant:
 		err = subframe.decodeConstant(br, bps)
@@ -54,7 +73,7 @@ func (frame *Frame) parseSubframe(br *bits.Reader, bps uint, samples []int32) (s
 	for i, sample := range subframe.Samples {
 		subframe.Samples[i] = sample << subframe.Wasted
 	}
-	return subframe, err
+	return err
 }
 
 // A SubHeader specifies the prediction method and order of a subframe.
@@ -271,7 +290,12 @@ func (subframe *Subframe) decodeVerbatim(br *bits.Reader, bps uint) error {
 // depths. All bytes are read in a single I/O call, then unpacked into samples.
 func (subframe *Subframe) decodeVerbatimAligned(br *bits.Reader, bps uint) error {
 	bytesPerSample := int(bps / 8)
-	buf := make([]byte, subframe.NSamples*bytesPerSample)
+	needed := subframe.NSamples * bytesPerSample
+	// Reuse the grow-only verbatim buffer across frames.
+	if cap(subframe.verbatimBuf) < needed {
+		subframe.verbatimBuf = make([]byte, needed)
+	}
+	buf := subframe.verbatimBuf[:needed]
 	if err := br.ReadAligned(buf); err != nil {
 		return unexpected(err)
 	}
@@ -396,8 +420,8 @@ func (subframe *Subframe) decodeFIR(br *bits.Reader, bps uint) error {
 	shift := signExtend(x, 5)
 	subframe.CoeffShift = shift
 
-	// Parse coefficients.
-	coeffs := make([]int32, subframe.Order)
+	// Parse coefficients using the fixed-size buffer (max LPC order is 32).
+	coeffs := subframe.coeffsBuf[:subframe.Order]
 	for i := range coeffs {
 		// (prec) bits: Predictor coefficient.
 		x, err = br.Read(prec)
@@ -479,7 +503,13 @@ func (subframe *Subframe) decodeRicePart(br *bits.Reader, paramSize uint) error 
 	// ref: https://www.xiph.org/flac/format.html#rice_partition
 	// ref: https://www.xiph.org/flac/format.html#rice2_partition
 	nparts := 1 << partOrder
-	partitions := make([]RicePartition, nparts)
+	// Reuse the grow-only partition buffer across frames.
+	if cap(subframe.partitionsBuf) < nparts {
+		subframe.partitionsBuf = make([]RicePartition, nparts)
+	}
+	partitions := subframe.partitionsBuf[:nparts]
+	// Zero the partition structs for reuse.
+	clear(partitions)
 	riceSubframe.Partitions = partitions
 	for i := 0; i < nparts; i++ {
 		partition := &partitions[i]

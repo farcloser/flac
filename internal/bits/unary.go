@@ -1,6 +1,7 @@
 package bits
 
 import (
+	"encoding/binary"
 	"math/bits"
 
 	"github.com/icza/bitio"
@@ -38,33 +39,55 @@ func (br *Reader) ReadUnary() (x uint64, err error) {
 		br.x = 0
 	}
 
-	// Scan whole bytes from the internal buffer.
+	// Scan bytes from the internal buffer with batch CRC updates.
+	// CRC is computed once per refill cycle over the entire consumed range,
+	// rather than per-byte as in the naive implementation.
 	for {
-		if br.available() == 0 {
-			if err = br.fill(); err != nil {
-				return 0, err
+		startPos := br.pos
+
+		// Word-at-a-time scan: check 8 bytes at once using LeadingZeros64.
+		for br.available() >= 8 {
+			w := binary.BigEndian.Uint64(br.buf[br.pos:])
+			if w != 0 {
+				lz := uint(bits.LeadingZeros64(w))
+				x += uint64(lz)
+				// Advance past the zero bytes and the byte containing the 1-bit.
+				br.pos += int(lz/8) + 1
+				br.consumeBytes(startPos, br.pos)
+				// Buffer the remaining bits in the terminating byte.
+				b := br.buf[br.pos-1]
+				bitInByte := lz % 8
+				br.n = 7 - bitInByte
+				br.x = b & ((1 << br.n) - 1)
+				return x, nil
 			}
+			// All 8 bytes are zero.
+			x += 64
+			br.pos += 8
 		}
 
-		b := br.buf[br.pos]
-		br.pos++
-		br.consumeBytes(br.pos-1, br.pos)
-
-		if b == 0 {
-			// Entire byte is zeros.
-			x += 8
-			continue
+		// Byte-at-a-time tail for the remaining < 8 bytes.
+		for br.available() > 0 {
+			b := br.buf[br.pos]
+			br.pos++
+			if b == 0 {
+				x += 8
+				continue
+			}
+			// Found a byte with a 1-bit.
+			lz := uint(bits.LeadingZeros8(b))
+			x += uint64(lz)
+			br.consumeBytes(startPos, br.pos)
+			br.n = 7 - lz
+			br.x = b & ((1 << br.n) - 1)
+			return x, nil
 		}
 
-		// Found a byte with a 1-bit. Count leading zeros.
-		lz := uint(bits.LeadingZeros8(b))
-		x += uint64(lz)
-
-		// Buffer the remaining bits after the terminating 1-bit.
-		br.n = 7 - lz
-		br.x = b & ((1 << br.n) - 1)
-
-		return x, nil
+		// Buffer exhausted. Batch CRC for everything consumed so far, then refill.
+		br.consumeBytes(startPos, br.pos)
+		if err = br.fill(); err != nil {
+			return 0, err
+		}
 	}
 }
 
