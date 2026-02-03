@@ -277,6 +277,10 @@ var (
 	ErrInvalidSync = errors.New("frame.Frame.parseHeader: invalid sync-code")
 )
 
+// maxSyncScan is the maximum number of zero bytes to skip when scanning for a
+// frame sync code through undeclared zero padding.
+const maxSyncScan = 32 << 20 // 32 MB
+
 // parseHeader reads and parses the header of an audio frame.
 func (frame *Frame) parseHeader() error {
 	// Enable CRC-8 accumulation for header verification.
@@ -290,26 +294,34 @@ func (frame *Frame) parseHeader() error {
 		// a graceful end of a FLAC stream.
 		return err
 	}
-	if x != 0x3FFE {
-		return ErrInvalidSync
-	}
-
-	// 1 bit: reserved.
-	x, err = br.Read(1)
-	if err != nil {
-		return unexpected(err)
-	}
-	if x != 0 {
-		return errors.New("frame.Frame.parseHeader: non-zero reserved value")
-	}
-
-	// 1 bit: HasFixedBlockSize.
-	x, err = br.Read(1)
-	if err != nil {
-		return unexpected(err)
-	}
 	if x == 0 {
-		frame.HasFixedBlockSize = true
+		// All zeros: undeclared zero padding before the first audio frame
+		// (e.g. HDtracks FLAC files with 16 MB of zeros after metadata).
+		// Scan forward to the real sync code. On return, the reserved and
+		// blocking strategy bits have been consumed.
+		if err := frame.scanToSync(); err != nil {
+			return err
+		}
+	} else if x == 0x3FFE {
+		// 1 bit: reserved.
+		x, err = br.Read(1)
+		if err != nil {
+			return unexpected(err)
+		}
+		if x != 0 {
+			return errors.New("frame.Frame.parseHeader: non-zero reserved value")
+		}
+
+		// 1 bit: HasFixedBlockSize.
+		x, err = br.Read(1)
+		if err != nil {
+			return unexpected(err)
+		}
+		if x == 0 {
+			frame.HasFixedBlockSize = true
+		}
+	} else {
+		return ErrInvalidSync
 	}
 
 	// 4 bits: BlockSize. The block size parsing is simplified by deferring it to
@@ -382,6 +394,86 @@ func (frame *Frame) parseHeader() error {
 	}
 
 	return nil
+}
+
+// scanToSync scans forward through undeclared zero padding to locate the next
+// FLAC frame sync code.
+//
+// Some FLAC files (e.g. from HDtracks) contain large blocks of zero bytes
+// between the last metadata block and the first audio frame that are not
+// declared as FLAC Padding metadata. Standard decoders (libFLAC, ffmpeg) fail
+// on these files because they expect audio frames immediately after metadata.
+//
+// Precondition: the caller's Read(14) returned all zeros, leaving 2 zero bits
+// buffered. On return, the full 16-bit sync word (sync code + reserved +
+// blocking strategy) has been consumed, HasFixedBlockSize is set, and
+// CRC-8/CRC-16 have been reset and seeded with the two sync bytes.
+func (frame *Frame) scanToSync() error {
+	br := frame.br
+
+	// The caller's Read(14) consumed 2 zero bytes with 2 bits still buffered.
+	// Drain them before switching to byte-aligned scanning.
+	if n := br.BitsBuffered(); n > 0 {
+		pad, err := br.Read(n)
+		if err != nil {
+			return unexpected(err)
+		}
+
+		if pad != 0 {
+			return ErrInvalidSync
+		}
+	}
+
+	// Scan byte-by-byte through zeros for the first sync byte (0xFF).
+	// Only zero bytes are tolerated; any non-zero byte that is not 0xFF
+	// is treated as corruption.
+	for skipped := 0; skipped < maxSyncScan; skipped++ {
+		b, err := br.Read(8)
+		if err != nil {
+			if err == io.EOF {
+				return io.ErrUnexpectedEOF
+			}
+
+			return err
+		}
+
+		if b == 0 {
+			continue
+		}
+
+		if b != 0xFF {
+			return ErrInvalidSync
+		}
+
+		// Found 0xFF. Read the second byte of the sync word.
+		// Valid patterns:
+		//   0xFFF8 = sync(0x3FFE) + reserved(0) + blocking(0) → fixed block size
+		//   0xFFF9 = sync(0x3FFE) + reserved(0) + blocking(1) → variable block size
+		next, err := br.Read(8)
+		if err != nil {
+			return unexpected(err)
+		}
+
+		switch next {
+		case 0xF8:
+			frame.HasFixedBlockSize = true
+		case 0xF9:
+			// Variable block size; HasFixedBlockSize stays false.
+		default:
+			return ErrInvalidSync
+		}
+
+		// Reset CRC checksums to start from this frame and seed with the
+		// two sync bytes so the header CRC covers the complete frame header.
+		syncBytes := [2]byte{0xFF, byte(next)}
+		br.EnableCRC16()
+		br.EnableCRC8()
+		br.FeedCRC(syncBytes[:])
+
+		return nil
+	}
+
+	return ErrInvalidSync
 }
 
 // parseBitsPerSample parses the bits per sample of the header.

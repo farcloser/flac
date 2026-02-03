@@ -135,6 +135,19 @@ func (br *Reader) CRC8() uint8 {
 	return br.crc8
 }
 
+// FeedCRC updates active CRC checksums with the provided bytes. Use this to
+// include bytes that were identified outside the normal Read path (e.g. frame
+// sync bytes found during a zero-padding scan).
+func (br *Reader) FeedCRC(data []byte) {
+	if br.doCRC16 {
+		br.crc16 = crc16.Update(br.crc16, crc16.IBMTable, data)
+	}
+
+	if br.doCRC8 {
+		br.crc8 = crc8.Update(br.crc8, crc8.ATMTable, data)
+	}
+}
+
 // Reset discards all buffered data and CRC state. Call after seeking the
 // underlying reader to invalidate the read-ahead buffer.
 func (br *Reader) Reset() {
